@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local configuration and version state
+/config.json
+/versions.json
+/.env
+/.env.*
+
+# PyInstaller output
+/build/
+/dist/
+/OdfSender.spec
+
+# Input XML data
+/*.xml
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
