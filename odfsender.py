@@ -46,6 +46,15 @@ def pause_before_exit() -> None:
 
 ODF_BODY_RE = re.compile(rb"<OdfBody\b[^>]*>")
 VERSION_RE = re.compile(rb'(\bVersion\s*=\s*)(["\'])(.*?)\2')
+DATE_RE = re.compile(
+    rb'\bDate\s*=\s*(["\'])\s*(\d{4})-?(\d{2})-?(\d{2})\s*\1'
+)
+# HHMMSS followed by any number of fractional-second digits (HHMMSSm,
+# HHMMSSmm, HHMMSSmmm, ...). Colons and a "." or "," before the
+# fraction are tolerated too.
+TIME_RE = re.compile(
+    rb'\bTime\s*=\s*(["\'])\s*(\d{2}):?(\d{2}):?(\d{2})(?:[.,]?(\d*))?\s*\1'
+)
 
 
 # ============================================================
@@ -59,6 +68,7 @@ class FilePlan:
     remembered_version: int | None
     version_to_send: int | None
     error: str | None = None
+    document_time: str | None = None
 
 
 # ============================================================
@@ -82,6 +92,48 @@ def get_xml_version(xml: bytes) -> int:
         raise ValueError(
             f"Invalid Version value: {version_match.group(3)!r}"
         )
+
+
+def get_xml_timestamp(xml: bytes) -> str | None:
+    """
+    Returns "YYYY-MM-DD HH:MM:SS.ffffff" from the Date and Time attributes
+    of <OdfBody>, or None if either is missing or malformed.
+
+    Time is HHMMSS plus any number of fractional-second digits, so
+    "062046", "06204639", "062046394" are 06:20:46.000, .390 and .394.
+    The fraction is padded/truncated to 6 digits, so the result always
+    sorts chronologically as a plain string.
+    """
+
+    body_match = ODF_BODY_RE.search(xml)
+
+    if not body_match:
+        return None
+
+    tag = body_match.group(0)
+    date_match = DATE_RE.search(tag)
+    time_match = TIME_RE.search(tag)
+
+    if not date_match or not time_match:
+        return None
+
+    year, month, day = (g.decode("ascii") for g in date_match.groups()[1:])
+    hour, minute, second, fraction = (
+        g.decode("ascii") for g in time_match.groups()[1:]
+    )
+
+    if not (
+        1 <= int(month) <= 12
+        and 1 <= int(day) <= 31
+        and int(hour) <= 24
+        and int(minute) <= 59
+        and int(second) <= 60
+    ):
+        return None
+
+    fraction = fraction.ljust(6, "0")[:6]
+
+    return f"{year}-{month}-{day} {hour}:{minute}:{second}.{fraction}"
 
 
 def set_xml_version(xml: bytes, version: int) -> bytes:
@@ -258,6 +310,7 @@ def get_xml_files() -> list[Path]:
     if not directory.is_dir():
         return []
 
+    # Oldest first (by modification time); name breaks ties.
     return sorted(
         file
         for file in directory.iterdir()
@@ -323,6 +376,7 @@ def analyze_files() -> list[FilePlan]:
                     current_version=current_version,
                     remembered_version=remembered_version,
                     version_to_send=version_to_send,
+                    document_time=get_xml_timestamp(xml),
                 )
             )
 
@@ -336,6 +390,16 @@ def analyze_files() -> list[FilePlan]:
                     error=str(e),
                 )
             )
+
+    # Oldest document first, using Date/Time from inside the XML.
+    # Files without a usable timestamp go last, ordered by name.
+    plans.sort(
+        key=lambda plan: (
+            plan.document_time is None,
+            plan.document_time or "",
+            plan.file.name,
+        )
+    )
 
     return plans
 
@@ -462,6 +526,7 @@ def preview(plans: list[FilePlan]) -> None:
     )
 
     table.add_column("File")
+    table.add_column("Document time")
     table.add_column(
         "Current",
         justify="right",
@@ -483,6 +548,7 @@ def preview(plans: list[FilePlan]) -> None:
                 "-",
                 "-",
                 "-",
+                "-",
                 f"[red]{plan.error}[/red]",
             )
 
@@ -496,6 +562,7 @@ def preview(plans: list[FilePlan]) -> None:
 
         table.add_row(
             plan.file.name,
+            plan.document_time or "-",
             str(plan.current_version),
             (
                 str(plan.remembered_version)
@@ -522,6 +589,92 @@ def preview(plans: list[FilePlan]) -> None:
         f"[bold red]{errors}[/bold red] error(s)."
     )
 
+    console.print(
+        "[dim]Nothing was sent or modified.[/dim]"
+    )
+    console.print()
+
+
+def show_send_order(plans: list[FilePlan]) -> None:
+    """
+    Lists the files in the exact order they will be sent, with the
+    version each one will go out with. Read-only.
+    """
+
+    valid_plans = [
+        plan
+        for plan in plans
+        if plan.error is None
+    ]
+
+    skipped = [
+        plan
+        for plan in plans
+        if plan.error is not None
+    ]
+
+    if not valid_plans:
+        console.print(
+            "[yellow]There are no valid files to send.[/yellow]"
+        )
+        return
+
+    table = Table(
+        title="Send Order (oldest first)",
+    )
+
+    table.add_column(
+        "#",
+        justify="right",
+    )
+    table.add_column("File")
+    table.add_column("Document time")
+    table.add_column(
+        "Version",
+        justify="right",
+    )
+
+    for index, plan in enumerate(valid_plans, start=1):
+        if plan.version_to_send is None:
+            version = f"{plan.current_version} (unchanged)"
+        elif plan.version_to_send == plan.current_version:
+            version = f"{plan.version_to_send} (same)"
+        else:
+            version = (
+                f"{plan.current_version} -> {plan.version_to_send}"
+            )
+
+        table.add_row(
+            str(index),
+            plan.file.name,
+            plan.document_time or "[yellow]- (no Date/Time)[/yellow]",
+            version,
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    console.print(
+        f"[bold]{len(valid_plans)}[/bold] file(s) to "
+        f"[bold]{len(CONFIG['URLS'])}[/bold] endpoint(s):"
+    )
+
+    for url in CONFIG["URLS"]:
+        console.print(f"  {url}")
+
+    if skipped:
+        console.print()
+        console.print(
+            f"[red]{len(skipped)} file(s) will be skipped:[/red]"
+        )
+
+        for plan in skipped:
+            console.print(
+                f"  [red]{plan.file.name}: {plan.error}[/red]"
+            )
+
+    console.print()
     console.print(
         "[dim]Nothing was sent or modified.[/dim]"
     )
@@ -829,6 +982,7 @@ def main() -> None:
             message="ODF Sender",
             choices=[
                 preview_label,
+                "Show send order",
                 send_label,
                 "Write versions to files",
                 "View config",
@@ -841,6 +995,9 @@ def main() -> None:
 
         if action == preview_label:
             preview(plans)
+
+        elif action == "Show send order":
+            show_send_order(plans)
 
         elif action == send_label:
             #
