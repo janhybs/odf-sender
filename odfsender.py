@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from InquirerPy import inquirer
+from InquirerPy.base.control import Choice
 from InquirerPy.utils import get_style
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -310,7 +311,8 @@ def get_xml_files() -> list[Path]:
     if not directory.is_dir():
         return []
 
-    # Oldest first (by modification time); name breaks ties.
+    # Name order here; analyze_files() re-sorts oldest first by the
+    # Date/Time inside each XML.
     return sorted(
         file
         for file in directory.iterdir()
@@ -319,7 +321,7 @@ def get_xml_files() -> list[Path]:
     )
 
 
-def analyze_files() -> list[FilePlan]:
+def analyze_files(first_send: str = "increment") -> list[FilePlan]:
     """
     Reads and validates all XML files beforehand.
 
@@ -327,6 +329,12 @@ def analyze_files() -> list[FilePlan]:
       - dynamic menu counts
       - preview
       - send planning
+
+    first_send only matters in "auto" mode, for files that have no
+    remembered version yet:
+      - "increment": file version + 1
+      - "as-is":     file version unchanged
+      - "one":       start at 1
     """
 
     files = get_xml_files()
@@ -364,6 +372,10 @@ def analyze_files() -> list[FilePlan]:
             elif CONFIG["VERSION"] == "auto":
                 if remembered_version is not None:
                     version_to_send = remembered_version + 1
+                elif first_send == "as-is":
+                    version_to_send = current_version
+                elif first_send == "one":
+                    version_to_send = 1
                 else:
                     version_to_send = current_version + 1
 
@@ -492,8 +504,14 @@ def show_help() -> None:
     )
     console.print(
         '  [bold]"auto"[/bold]  Increment each file version before sending. '
-        "Uses its remembered version from versions.json, or the current "
-        "XML version if none is remembered. Successful sends are remembered."
+        "Uses its remembered version from versions.json. Successful sends "
+        "are remembered."
+    )
+    console.print(
+        "         For files with no remembered version, you are asked when "
+        "sending: send as is (keep the version inside the file), "
+        "increment it, or start with 1. The send order shows the result "
+        "before you confirm."
     )
     console.print(
         '  [bold]An integer[/bold]  Send every file with exactly that version '
@@ -595,10 +613,69 @@ def preview(plans: list[FilePlan]) -> None:
     console.print()
 
 
-def show_send_order(plans: list[FilePlan]) -> None:
+def count_first_sends(plans: list[FilePlan]) -> int:
+    """Files that "auto" mode has no remembered version for."""
+
+    if CONFIG["VERSION"] != "auto":
+        return 0
+
+    return sum(
+        1
+        for plan in plans
+        if plan.error is None
+        and plan.remembered_version is None
+    )
+
+
+def ask_first_send(plans: list[FilePlan], current: str) -> str | None:
+    """
+    In "auto" mode, asks how files without a remembered version should
+    be numbered. Returns the choice, or None if the user cancels.
+    Nothing is asked when every file is already remembered.
+    """
+
+    first_sends = count_first_sends(plans)
+
+    if first_sends == 0:
+        return current
+
+    valid = sum(1 for plan in plans if plan.error is None)
+
+    return inquirer.select(
+        message=(
+            f"{first_sends} of {valid} file(s) have no remembered "
+            "version. How should they be numbered?"
+        ),
+        choices=[
+            Choice(
+                "as-is",
+                "Send as is (use the version inside the file, e.g. 3 -> 3)",
+            ),
+            Choice(
+                "increment",
+                "Increment and send (e.g. 3 -> 4)",
+            ),
+            Choice(
+                "one",
+                "Start with 1 (then 2, 3, ... on the next sends)",
+            ),
+            Choice(None, "Cancel"),
+        ],
+        default=current,
+        style=MENU_STYLE,
+    ).execute()
+
+
+def show_send_order(
+    plans: list[FilePlan],
+    read_only: bool = True,
+) -> None:
     """
     Lists the files in the exact order they will be sent, with the
-    version each one will go out with. Read-only.
+    version each one will go out with.
+
+    read_only=False is used right before sending, so the closing
+    "nothing was sent" note is left out.
     """
 
     valid_plans = [
@@ -644,6 +721,18 @@ def show_send_order(plans: list[FilePlan]) -> None:
                 f"{plan.current_version} -> {plan.version_to_send}"
             )
 
+        if (
+            CONFIG["VERSION"] == "auto"
+            and plan.remembered_version is None
+        ):
+            version += " (first send)"
+
+        if (
+            plan.version_to_send is not None
+            and plan.version_to_send < plan.current_version
+        ):
+            version = f"[yellow]{version} (lower!)[/yellow]"
+
         table.add_row(
             str(index),
             plan.file.name,
@@ -654,6 +743,21 @@ def show_send_order(plans: list[FilePlan]) -> None:
     console.print()
     console.print(table)
     console.print()
+
+    lower = sum(
+        1
+        for plan in valid_plans
+        if plan.version_to_send is not None
+        and plan.version_to_send < plan.current_version
+    )
+
+    if lower:
+        console.print(
+            f"[yellow]{lower} file(s) will be sent with a version lower "
+            "than the one inside the file. The receiver may reject "
+            "them if it already has a higher version.[/yellow]"
+        )
+        console.print()
 
     console.print(
         f"[bold]{len(valid_plans)}[/bold] file(s) to "
@@ -675,10 +779,12 @@ def show_send_order(plans: list[FilePlan]) -> None:
             )
 
     console.print()
-    console.print(
-        "[dim]Nothing was sent or modified.[/dim]"
-    )
-    console.print()
+
+    if read_only:
+        console.print(
+            "[dim]Nothing was sent or modified.[/dim]"
+        )
+        console.print()
 
 
 # ============================================================
@@ -697,6 +803,8 @@ def send_files(plans: list[FilePlan]) -> None:
             "[yellow]There are no valid files to send.[/yellow]"
         )
         return
+
+    show_send_order(plans, read_only=False)
 
     confirmed = inquirer.confirm(
         message=(
@@ -943,6 +1051,13 @@ def main() -> None:
         pause_before_exit()
         return
 
+    #
+    # How "auto" numbers files that have no remembered version yet.
+    # Asked again on every send while such files exist; the last
+    # answer is the default and is what Preview/Show send order use.
+    #
+    first_send = "increment"
+
     while True:
         #
         # Analyze before displaying the menu.
@@ -950,7 +1065,7 @@ def main() -> None:
         # This means "Send 56 files" reflects what's actually
         # present and valid right now.
         #
-        plans = analyze_files()
+        plans = analyze_files(first_send)
 
         sendable_count = sum(
             1
@@ -1005,7 +1120,16 @@ def main() -> None:
             # The directory may have changed while the
             # menu was open.
             #
-            plans = analyze_files()
+            plans = analyze_files(first_send)
+
+            choice = ask_first_send(plans, first_send)
+
+            if choice is None:
+                continue
+
+            if choice != first_send:
+                first_send = choice
+                plans = analyze_files(first_send)
 
             send_files(plans)
 
