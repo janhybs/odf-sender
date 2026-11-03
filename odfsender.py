@@ -1,25 +1,36 @@
+import io
 import json
 import logging
 import os
 import re
+import shutil
 import sys
+import threading
 import traceback
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from InquirerPy import inquirer
-from InquirerPy.utils import get_style
+from prompt_toolkit.application import Application
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+from prompt_toolkit.formatted_text.utils import split_lines
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+from prompt_toolkit.styles import Style
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 console = Console()
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 TOKEN_HEADER = "x-ApiKey"
 APP_DIR = (
     Path(sys.executable).resolve().parent
@@ -30,24 +41,41 @@ CONFIG_FILE = APP_DIR / "config.json"
 VERSIONS_FILE = APP_DIR / "versions.json"
 HTTP_TIMEOUT_SECONDS = 30
 log = logging.getLogger("odfsender")
+# Without a handler, Python's fallback prints warnings to stderr, which
+# would draw over the full-screen UI whenever the log file can't be opened.
+log.addHandler(logging.NullHandler())
 AUTO_MODES = ("auto", "auto-as-is")
 CONFIG: dict[str, Any] = {}
-MENU_STYLE = get_style(
-    {
-        "question": "fg:#1f2937 bg:#ffd54a bold",
-        "highlighted": "fg:#ffffff bg:#005fb8",
-        "selected": "fg:#ffffff bg:#005fb8",
-        "selected-option": "fg:#ffffff bg:#005fb8",
-        "pointer": "fg:#ffffff bg:#005fb8",
-    }
-)
+
+
+class QuietFileHandler(logging.FileHandler):
+    """
+    File handler that opens its file on the first line and never lets a
+    logging problem (unwritable folder, full disk) reach the UI.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except Exception:
+            pass
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        pass
+
+
+session_logged = False
 
 
 def setup_logging() -> None:
     """
-    Starts a new log file next to the app for this run, named
+    Prepares a log file next to the app for this run, named
     sender_yyyy-mm-dd_hh-MM-ss.log.
-    If the log cannot be opened, the sender keeps working without it.
+
+    Nothing is written until log_session_start() is called, which
+    happens when something is actually sent or written. Opening the
+    app, looking around and closing it leaves no log file behind.
+    If the log cannot be written, the sender keeps working without it.
     """
 
     log.setLevel(logging.INFO)
@@ -56,19 +84,29 @@ def setup_logging() -> None:
         "sender_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
     )
 
-    try:
-        handler = logging.FileHandler(log_file, encoding="utf-8")
-    except OSError as e:
-        console.print(
-            f"[yellow]Could not open {log_file.name}: {e}. "
-            "Continuing without a log file.[/yellow]"
-        )
-        return
+    handler = QuietFileHandler(log_file, encoding="utf-8", delay=True)
 
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
     )
     log.addHandler(handler)
+
+
+def log_session_start() -> None:
+    """Writes the "started" line once, before the first logged action."""
+
+    global session_logged
+
+    if session_logged:
+        return
+
+    session_logged = True
+
+    log.info(
+        "ODF Sender v%s started (VERSION=%r)",
+        APP_VERSION,
+        CONFIG["VERSION"],
+    )
 
 
 def pause_before_exit() -> None:
@@ -493,6 +531,25 @@ def send_xml(url: str, xml: bytes) -> int:
 # UI
 # ============================================================
 
+@contextmanager
+def use_console(target: Console) -> Iterator[Console]:
+    """
+    Points the module-level console at another Console for the duration
+    of the block, so the view functions can print into the full-screen
+    UI's content pane instead of straight to the terminal.
+    """
+
+    global console
+
+    previous = console
+    console = target
+
+    try:
+        yield target
+    finally:
+        console = previous
+
+
 def view_config() -> None:
     table = Table(
         title="Configuration",
@@ -533,6 +590,27 @@ def view_config() -> None:
 
 
 def show_help() -> None:
+    console.print()
+    console.print("[bold]Keys[/bold]")
+    console.print(
+        "  [bold]Left/Right + Enter[/bold]  Pick a menu item (or click it), "
+        "or press its underlined letter."
+    )
+    console.print(
+        "  [bold]Up/Down, PgUp/PgDn, Home/End[/bold]  Scroll the view "
+        "(the mouse wheel works too)."
+    )
+    console.print(
+        "  [bold]Enter or y / n or Esc[/bold]  Confirm or cancel a question "
+        "in the bottom line."
+    )
+    console.print(
+        "  [bold]Ctrl+C[/bold]  While sending: stop after the current file. "
+        "Otherwise: quit."
+    )
+    console.print(
+        "  [dim]Hold Shift while dragging to select text with the mouse.[/dim]"
+    )
     console.print()
     console.print("[bold]Version configuration[/bold]")
     console.print(
@@ -578,9 +656,13 @@ def mask_token(token: str) -> str:
 
 def preview(plans: list[FilePlan]) -> None:
     table = Table(
-        title="Send Preview",
+        title="Send Preview (oldest first)",
     )
 
+    table.add_column(
+        "#",
+        justify="right",
+    )
     table.add_column("File")
     table.add_column("Document time")
     table.add_column(
@@ -597,9 +679,14 @@ def preview(plans: list[FilePlan]) -> None:
     )
     table.add_column("Status")
 
+    # Numbered in send order. Files with errors are not sent, so they
+    # get no number.
+    position = 0
+
     for plan in plans:
         if plan.error:
             table.add_row(
+                "-",
                 plan.file.name,
                 "-",
                 "-",
@@ -610,6 +697,8 @@ def preview(plans: list[FilePlan]) -> None:
 
             continue
 
+        position += 1
+
         version_to_send = (
             str(plan.version_to_send)
             if plan.version_to_send is not None
@@ -617,6 +706,7 @@ def preview(plans: list[FilePlan]) -> None:
         )
 
         table.add_row(
+            str(position),
             plan.file.name,
             plan.document_time or "-",
             str(plan.current_version),
@@ -651,16 +741,10 @@ def preview(plans: list[FilePlan]) -> None:
     console.print()
 
 
-def show_send_order(
-    plans: list[FilePlan],
-    read_only: bool = True,
-) -> None:
+def show_send_order(plans: list[FilePlan]) -> None:
     """
     Lists the files in the exact order they will be sent, with the
-    version each one will go out with.
-
-    read_only=False is used right before sending, so the closing
-    "nothing was sent" note is left out.
+    version each one will go out with. Shown right before sending.
     """
 
     valid_plans = [
@@ -762,43 +846,45 @@ def show_send_order(
 
     console.print()
 
-    if read_only:
-        console.print(
-            "[dim]Nothing was sent or modified.[/dim]"
-        )
-        console.print()
-
 
 # ============================================================
 # Sending
 # ============================================================
 
-def send_files(plans: list[FilePlan]) -> None:
+def send_description(count: int) -> str:
+    description = f"Send {count} files"
+
+    if CONFIG["VERSION"] is None:
+        description += " without changing versions"
+    elif is_auto():
+        description += " and increment the version"
+    else:
+        description += f" with Version {CONFIG['VERSION']}"
+
+    return description
+
+
+def send_files(
+    plans: list[FilePlan],
+    should_stop: Callable[[], bool] = lambda: False,
+    on_status: Callable[[str], None] = lambda text: None,
+) -> tuple[int, int]:
+    """
+    Sends every valid plan, oldest first, and returns
+    (fully_sent, failed).
+
+    should_stop is checked between files, never in the middle of one, so
+    a file always goes to all endpoints or is not started at all.
+    on_status receives a short "what is happening now" text.
+    """
+
     valid_plans = [
         plan
         for plan in plans
         if plan.error is None
     ]
 
-    if not valid_plans:
-        console.print(
-            "[yellow]There are no valid files to send.[/yellow]"
-        )
-        return
-
-    show_send_order(plans, read_only=False)
-
-    confirmed = inquirer.confirm(
-        message=(
-            f"Send {len(valid_plans)} files "
-            f"to {len(CONFIG['URLS'])} endpoint(s)?"
-        ),
-        default=False,
-    ).execute()
-
-    if not confirmed:
-        log.info("Send cancelled by user (%d file(s) ready)", len(valid_plans))
-        return
+    log_session_start()
 
     versions = (
         load_versions()
@@ -826,6 +912,22 @@ def send_files(plans: list[FilePlan]) -> None:
     console.print()
 
     for plan in valid_plans:
+        if should_stop():
+            log.warning(
+                "Send stopped by user after %d of %d file(s)",
+                fully_sent + failed,
+                len(valid_plans),
+            )
+
+            console.print(
+                "[yellow]Stopped by user. The remaining files "
+                "were not sent.[/yellow]"
+            )
+
+            console.print()
+
+            break
+
         console.print(
             f"[bold]{plan.file.name}[/bold]"
         )
@@ -868,23 +970,12 @@ def send_files(plans: list[FilePlan]) -> None:
 
             for url in CONFIG["URLS"]:
                 try:
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn(
-                            f"POST {url}"
-                        ),
-                        transient=True,
-                    ) as progress:
+                    on_status(f"Sending {plan.file.name} to {url}")
 
-                        progress.add_task(
-                            "",
-                            total=None,
-                        )
-
-                        status = send_xml(
-                            url,
-                            xml_to_send,
-                        )
+                    status = send_xml(
+                        url,
+                        xml_to_send,
+                    )
 
                     console.print(
                         f"  [green]✓[/green] {url}"
@@ -965,25 +1056,40 @@ def send_files(plans: list[FilePlan]) -> None:
         failed,
     )
 
+    console.print(
+        f"[bold]Done:[/bold] {fully_sent} of {len(valid_plans)} file(s) "
+        f"fully sent, {failed} failed."
+    )
+
+    console.print()
+
+    return fully_sent, failed
+
 
 # ============================================================
 # Write remembered versions into XML files
 # ============================================================
 
-def write_versions_to_files() -> None:
+def show_pending_version_writes() -> list[tuple[Path, int, int]]:
+    """
+    Prints which files would get their remembered version written into
+    them and returns them as (file, current, remembered). Returns an
+    empty list when there is nothing to write.
+    """
+
     try:
         versions = load_versions()
     except Exception as e:
         console.print(
             f"[red]Could not load versions.json: {e}[/red]"
         )
-        return
+        return []
 
     if not versions:
         console.print(
             "[yellow]No remembered versions found.[/yellow]"
         )
-        return
+        return []
 
     files = get_xml_files()
 
@@ -1035,7 +1141,7 @@ def write_versions_to_files() -> None:
             "[green]All XML files already have "
             "their remembered versions.[/green]"
         )
-        return
+        return []
 
     table = Table(
         title="Versions to write",
@@ -1062,16 +1168,18 @@ def write_versions_to_files() -> None:
     console.print(table)
     console.print()
 
-    confirmed = inquirer.confirm(
-        message=(
-            f"Write versions into "
-            f"{len(candidates)} files?"
-        ),
-        default=False,
-    ).execute()
+    return candidates
 
-    if not confirmed:
-        return
+
+def write_versions_to_files(
+    candidates: list[tuple[Path, int, int]],
+) -> None:
+    log_session_start()
+
+    log.info(
+        "Writing remembered versions into %d file(s)",
+        len(candidates),
+    )
 
     console.print()
 
@@ -1092,14 +1200,653 @@ def write_versions_to_files() -> None:
                 f"{current} → {remembered}"
             )
 
+            log.info(
+                "%s: wrote version %s (was %s)",
+                file.name,
+                remembered,
+                current,
+            )
+
         except Exception as e:
             console.print(
                 f"[red]✗ {file.name}: {e}[/red]"
             )
 
+            log.error("%s: write FAILED -> %s", file.name, e)
+
 
 # ============================================================
-# Main menu
+# Full-screen UI
+# ============================================================
+
+UI_STYLE = Style.from_dict(
+    {
+        "title": "bg:#ffd54a fg:#1f2937 bold",
+        "menu": "",
+        "menu.selected": "bg:#005fb8 fg:#ffffff",
+        "menu.disabled": "fg:#6b7280",
+        "menu.key": "underline",
+        "info": "fg:#9ca3af",
+        "info.error": "fg:#f87171",
+        "rule": "fg:#4b5563",
+        "status": "fg:#9ca3af",
+        "status.busy": "fg:#ffd54a",
+        "status.confirm": "bg:#ffd54a fg:#1f2937 bold",
+    }
+)
+
+# Rows the layout uses besides the content pane:
+# title, menu, info, rule, rule, status.
+FIXED_ROWS = 6
+
+# Menu order. The hotkey is the first letter of the item's label.
+MENU_ACTIONS = ("preview", "send", "write", "config", "help", "quit")
+
+
+@dataclass
+class Confirm:
+    question: str
+    on_yes: Callable[[], None]
+    on_no: Callable[[], None]
+
+
+class LiveWriter:
+    """File-like target that streams Rich output into the content pane."""
+
+    encoding = "utf-8"
+
+    def __init__(self, ui: "SenderUI") -> None:
+        self.ui = ui
+
+    def write(self, text: str) -> int:
+        self.ui.append_text(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return True
+
+
+class ContentControl(FormattedTextControl):
+    """The scrollable content pane; the mouse wheel scrolls it."""
+
+    def __init__(
+        self,
+        text: Callable[[], Any],
+        on_scroll: Callable[[int], None],
+    ) -> None:
+        super().__init__(text, show_cursor=False)
+        self.on_scroll = on_scroll
+
+    def mouse_handler(self, mouse_event: MouseEvent) -> Any:
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.on_scroll(-3)
+            return None
+
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.on_scroll(3)
+            return None
+
+        return NotImplemented
+
+
+def terminal_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size((100, 30))
+    return size.columns, size.lines
+
+
+def render_text(draw: Callable[[], None], width: int) -> str:
+    """Runs a view function and returns what it printed, as ANSI text."""
+
+    buffer = io.StringIO()
+
+    target = Console(
+        file=buffer,
+        force_terminal=True,
+        color_system="256",
+        width=width,
+        height=50,
+        legacy_windows=False,
+    )
+
+    with use_console(target):
+        draw()
+
+    return buffer.getvalue()
+
+
+class SenderUI:
+    """
+    Full-screen layout:
+
+        title bar with the current section
+        menu bar
+        settings / counts line
+        ----
+        content pane (scrolls)
+        ----
+        status line (hints, questions, progress)
+
+    Views are the same functions as before; their output is rendered to
+    ANSI and shown in the content pane. Sending runs in a worker thread
+    that streams into the pane.
+    """
+
+    def __init__(self) -> None:
+        self.plans: list[FilePlan] = analyze_files()
+        self.section: str | None = None
+        self.selected = 0
+
+        self.text = ""
+        self.version = 0
+        self.parsed_version = -1
+        self.lines: list[list[tuple[str, str]]] = []
+        self.scroll = 0
+        self.follow = False
+        self.draw: Callable[[], None] | None = None
+        self.render_width = 0
+
+        self.busy = False
+        self.status = ""
+        self.notice = ""
+        self.confirm: Confirm | None = None
+        self.stop_requested = threading.Event()
+
+        self.content_window = Window(
+            ContentControl(self.content_fragments, self.scroll_by),
+            wrap_lines=False,
+        )
+
+        self.app: Application[None] = Application(
+            layout=Layout(
+                HSplit(
+                    [
+                        Window(
+                            FormattedTextControl(self.title_fragments),
+                            height=1,
+                            style="class:title",
+                        ),
+                        Window(
+                            FormattedTextControl(self.menu_fragments),
+                            height=1,
+                        ),
+                        Window(
+                            FormattedTextControl(self.info_fragments),
+                            height=1,
+                            style="class:info",
+                        ),
+                        Window(height=1, char="─", style="class:rule"),
+                        self.content_window,
+                        Window(height=1, char="─", style="class:rule"),
+                        Window(
+                            FormattedTextControl(self.status_fragments),
+                            height=1,
+                            style=self.status_style,
+                        ),
+                    ]
+                )
+            ),
+            key_bindings=self.build_key_bindings(),
+            style=UI_STYLE,
+            full_screen=True,
+            mouse_support=True,
+        )
+
+        self.run_action("preview")
+
+    def run(self) -> None:
+        self.app.run()
+
+    # --------------------------------------------------------
+    # Content
+    # --------------------------------------------------------
+
+    def width(self) -> int:
+        # One column short of the terminal so a full-width table row
+        # never touches the last column.
+        return max(40, terminal_size()[0] - 1)
+
+    def view_height(self) -> int:
+        info = self.content_window.render_info
+
+        if info is not None:
+            return max(1, info.window_height)
+
+        return max(1, terminal_size()[1] - FIXED_ROWS)
+
+    def max_scroll(self) -> int:
+        return max(0, len(self.lines) - self.view_height())
+
+    def show(self, section: str, draw: Callable[[], None]) -> None:
+        """Replaces the content pane with a freshly rendered view."""
+
+        self.section = section
+        self.draw = draw
+        self.scroll = 0
+        self.follow = False
+        self.redraw()
+
+    def redraw(self) -> None:
+        if self.draw is None:
+            return
+
+        self.render_width = self.width()
+        self.text = render_text(self.draw, self.render_width)
+        self.version += 1
+
+    def append(self, draw: Callable[[], None]) -> None:
+        """Adds output below the current view and scrolls to it."""
+
+        # Output that did something (wrote files) must not be replayed on
+        # resize, so the view is frozen from here on.
+        self.draw = None
+        self.text += render_text(draw, self.render_width or self.width())
+        self.version += 1
+        self.follow = True
+
+    def append_text(self, text: str) -> None:
+        """Called from the worker thread with raw Rich output."""
+
+        self.text += text
+        self.version += 1
+        self.app.invalidate()
+
+    def parse(self) -> None:
+        lines = [
+            [(style, part) for style, part, *_ in line]
+            for line in split_lines(to_formatted_text(ANSI(self.text)))
+        ]
+
+        if self.text.endswith("\n") and lines and not any(
+            part for _, part in lines[-1]
+        ):
+            lines.pop()
+
+        self.lines = lines
+        self.parsed_version = self.version
+
+    def scroll_by(self, amount: int) -> None:
+        self.follow = False
+        self.scroll = max(0, min(self.scroll + amount, self.max_scroll()))
+
+    def content_fragments(self) -> list[tuple[str, str]]:
+        if (
+            self.draw is not None
+            and not self.busy
+            and self.width() != self.render_width
+        ):
+            self.redraw()
+
+        if self.parsed_version != self.version:
+            self.parse()
+
+        height = self.view_height()
+        max_scroll = self.max_scroll()
+
+        if self.follow:
+            self.scroll = max_scroll
+
+        self.scroll = max(0, min(self.scroll, max_scroll))
+
+        fragments: list[tuple[str, str]] = []
+
+        for index, line in enumerate(
+            self.lines[self.scroll:self.scroll + height]
+        ):
+            if index:
+                fragments.append(("", "\n"))
+
+            fragments.extend(line)
+
+        return fragments
+
+    # --------------------------------------------------------
+    # Bars
+    # --------------------------------------------------------
+
+    def menu_labels(self) -> dict[str, str]:
+        ready = sum(1 for plan in self.plans if plan.error is None)
+
+        return {
+            "preview": "Preview",
+            "send": f"Send {ready} files",
+            "write": "Write versions",
+            "config": "Config",
+            "help": "Help",
+            "quit": "Quit",
+        }
+
+    def title_fragments(self) -> list[tuple[str, str]]:
+        title = f" ODF Sender v{APP_VERSION}"
+
+        if self.section:
+            title += f"  ›  {self.section}"
+
+        return [("", title)]
+
+    def menu_fragments(self) -> list[Any]:
+        locked = self.busy or self.confirm is not None
+        labels = self.menu_labels()
+        fragments: list[Any] = []
+
+        for index, action in enumerate(MENU_ACTIONS):
+            label = labels[action]
+
+            if locked:
+                style = "class:menu.disabled"
+            elif index == self.selected:
+                style = "class:menu.selected"
+            else:
+                style = "class:menu"
+
+            def click(
+                mouse_event: MouseEvent,
+                action: str = action,
+                index: int = index,
+            ) -> None:
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.selected = index
+                    self.run_action(action)
+
+            fragments.append((style, " ", click))
+            fragments.append((f"{style} class:menu.key", label[0], click))
+            fragments.append((style, label[1:] + " ", click))
+            fragments.append(("", " "))
+
+        return fragments
+
+    def info_fragments(self) -> list[tuple[str, str]]:
+        ready = sum(1 for plan in self.plans if plan.error is None)
+        errors = len(self.plans) - ready
+
+        fragments = [
+            (
+                "",
+                f" Directory: {CONFIG['DIRECTORY']}  ·  "
+                f"Version: {CONFIG['VERSION']!r}  ·  "
+                f"{len(CONFIG['URLS'])} endpoint(s)  ·  "
+                f"{ready} ready, ",
+            ),
+        ]
+
+        fragments.append(
+            ("class:info.error" if errors else "", f"{errors} error(s)")
+        )
+
+        return fragments
+
+    def status_style(self) -> str:
+        if self.confirm is not None:
+            return "class:status.confirm"
+
+        if self.busy:
+            return "class:status.busy"
+
+        return "class:status"
+
+    def status_fragments(self) -> list[tuple[str, str]]:
+        if self.confirm is not None:
+            return [
+                (
+                    "",
+                    f" {self.confirm.question}  Enter/y: yes  ·  n/Esc: no  "
+                    "·  PgUp/PgDn: scroll the list first",
+                )
+            ]
+
+        if self.busy:
+            return [
+                (
+                    "",
+                    f" {self.status or 'Working...'}  ·  "
+                    "Ctrl+C: stop after the current file",
+                )
+            ]
+
+        left = (
+            f" {self.notice}"
+            if self.notice
+            else " Left/Right + Enter or underlined letter  ·  "
+            "Up/Down/PgUp/PgDn scroll  ·  Ctrl+C quit"
+        )
+
+        total = len(self.lines)
+        height = self.view_height()
+        right = ""
+
+        if total > height:
+            right = (
+                f"lines {self.scroll + 1}-"
+                f"{min(total, self.scroll + height)} of {total} "
+            )
+
+        padding = max(1, terminal_size()[0] - len(left) - len(right))
+
+        return [("", left + " " * padding + right)]
+
+    # --------------------------------------------------------
+    # Keys
+    # --------------------------------------------------------
+
+    def build_key_bindings(self) -> KeyBindings:
+        keys = KeyBindings()
+
+        idle = Condition(lambda: not self.busy and self.confirm is None)
+        asking = Condition(lambda: self.confirm is not None)
+
+        def move(step: int) -> None:
+            self.selected = (self.selected + step) % len(MENU_ACTIONS)
+
+        def page() -> int:
+            return max(1, self.view_height() - 1)
+
+        def to_end() -> None:
+            self.scroll = self.max_scroll()
+            self.follow = self.busy
+
+        def hotkey(action: str) -> Callable[[Any], None]:
+            def handler(event: Any) -> None:
+                self.selected = MENU_ACTIONS.index(action)
+                self.run_action(action)
+
+            return handler
+
+        def interrupt(event: Any) -> None:
+            if self.busy:
+                self.stop_requested.set()
+                self.status = "Stopping after the current file..."
+            elif self.confirm is not None:
+                self.answer(False)
+            else:
+                event.app.exit()
+
+        keys.add("left", filter=idle)(lambda event: move(-1))
+        keys.add("right", filter=idle)(lambda event: move(1))
+        keys.add("enter", filter=idle)(
+            lambda event: self.run_action(MENU_ACTIONS[self.selected])
+        )
+
+        for action, label in self.menu_labels().items():
+            letter = label[0].lower()
+            keys.add(letter, filter=idle)(hotkey(action))
+            keys.add(letter.upper(), filter=idle)(hotkey(action))
+
+        for key in ("y", "Y", "enter"):
+            keys.add(key, filter=asking)(lambda event: self.answer(True))
+
+        for key in ("n", "N"):
+            keys.add(key, filter=asking)(lambda event: self.answer(False))
+
+        keys.add("escape", filter=asking, eager=True)(
+            lambda event: self.answer(False)
+        )
+
+        keys.add("up")(lambda event: self.scroll_by(-1))
+        keys.add("down")(lambda event: self.scroll_by(1))
+        keys.add("pageup")(lambda event: self.scroll_by(-page()))
+        keys.add("pagedown")(lambda event: self.scroll_by(page()))
+        keys.add("home")(lambda event: self.scroll_by(-len(self.lines)))
+        keys.add("end")(lambda event: to_end())
+
+        keys.add("c-c", eager=True)(interrupt)
+
+        return keys
+
+    # --------------------------------------------------------
+    # Actions
+    # --------------------------------------------------------
+
+    def run_action(self, action: str) -> None:
+        if self.busy or self.confirm is not None:
+            return
+
+        self.notice = ""
+        self.plans = analyze_files()
+        plans = self.plans
+
+        if action == "preview":
+            self.show("Preview", lambda: preview(plans))
+
+        elif action == "send":
+            self.begin_send(plans)
+
+        elif action == "write":
+            self.begin_write()
+
+        elif action == "config":
+            self.show("Config", view_config)
+
+        elif action == "help":
+            self.show("Help", show_help)
+
+        elif action == "quit":
+            self.app.exit()
+
+    def ask(
+        self,
+        question: str,
+        on_yes: Callable[[], None],
+        on_no: Callable[[], None],
+    ) -> None:
+        self.confirm = Confirm(question, on_yes, on_no)
+
+    def answer(self, yes: bool) -> None:
+        confirm = self.confirm
+        self.confirm = None
+
+        if confirm is None:
+            return
+
+        if yes:
+            confirm.on_yes()
+        else:
+            confirm.on_no()
+
+    def begin_send(self, plans: list[FilePlan]) -> None:
+        valid_plans = [plan for plan in plans if plan.error is None]
+
+        self.show("Send", lambda: show_send_order(plans))
+
+        if not valid_plans:
+            return
+
+        def cancelled() -> None:
+            self.notice = "Send cancelled. Nothing was sent."
+
+        self.ask(
+            f"{send_description(len(valid_plans))} "
+            f"to {len(CONFIG['URLS'])} endpoint(s)?",
+            lambda: self.start_send(plans),
+            cancelled,
+        )
+
+    def start_send(self, plans: list[FilePlan]) -> None:
+        self.draw = None
+        self.text = ""
+        self.version += 1
+        self.scroll = 0
+        self.follow = True
+        self.busy = True
+        self.status = "Starting..."
+        self.stop_requested.clear()
+
+        width = self.width()
+
+        def set_status(text: str) -> None:
+            self.status = text
+            self.app.invalidate()
+
+        def worker() -> None:
+            live = Console(
+                file=LiveWriter(self),
+                force_terminal=True,
+                color_system="256",
+                width=width,
+                height=50,
+                legacy_windows=False,
+            )
+
+            sent = failed = 0
+
+            try:
+                with use_console(live):
+                    sent, failed = send_files(
+                        plans,
+                        should_stop=self.stop_requested.is_set,
+                        on_status=set_status,
+                    )
+
+                self.notice = (
+                    f"Send finished: {sent} sent, {failed} failed."
+                )
+
+            except Exception as e:
+                log.exception("Send crashed: %s", e)
+
+                with use_console(live):
+                    console.print(f"[red]ERROR: {e}[/red]")
+
+                self.notice = "Send failed. See the list above."
+
+            finally:
+                self.busy = False
+                self.plans = analyze_files()
+                self.app.invalidate()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def begin_write(self) -> None:
+        pending: list[list[tuple[Path, int, int]]] = [[]]
+
+        def draw() -> None:
+            pending[0] = show_pending_version_writes()
+
+        self.show("Write versions", draw)
+
+        candidates = pending[0]
+
+        if not candidates:
+            return
+
+        def apply() -> None:
+            self.append(lambda: write_versions_to_files(candidates))
+            self.plans = analyze_files()
+            self.notice = f"Wrote versions into {len(candidates)} file(s)."
+
+        def cancelled() -> None:
+            self.notice = "Cancelled. No files were changed."
+
+        self.ask(
+            f"Write versions into {len(candidates)} files?",
+            apply,
+            cancelled,
+        )
+
+
+# ============================================================
+# Entry point
 # ============================================================
 
 def main() -> None:
@@ -1109,89 +1856,10 @@ def main() -> None:
 
     setup_logging()
 
-    log.info(
-        "ODF Sender v%s started (VERSION=%r)",
-        APP_VERSION,
-        CONFIG["VERSION"],
-    )
+    SenderUI().run()
 
-    while True:
-        #
-        # Analyze before displaying the menu.
-        #
-        # This means "Send 56 files" reflects what's actually
-        # present and valid right now.
-        #
-        plans = analyze_files()
-
-        sendable_count = sum(
-            1
-            for plan in plans
-            if plan.error is None
-        )
-
-        error_count = len(plans) - sendable_count
-
-        send_label = f"Send {sendable_count} files"
-
-        if CONFIG["VERSION"] is None:
-            send_label += " without changing versions"
-        elif is_auto():
-            send_label += " and increment the version"
-        else:
-            send_label += f" with Version {CONFIG['VERSION']}"
-
-        preview_label = (
-            f"Preview {len(plans)} files"
-        )
-
-        if error_count:
-            preview_label += (
-                f" ({error_count} errors)"
-            )
-
-        action = inquirer.select(
-            message=f"ODF Sender v{APP_VERSION}",
-            choices=[
-                preview_label,
-                "Show send order",
-                send_label,
-                "Write versions to files",
-                "View config",
-                "Help",
-                "Exit",
-            ],
-            default=preview_label,
-            style=MENU_STYLE,
-        ).execute()
-
-        if action == preview_label:
-            preview(plans)
-
-        elif action == "Show send order":
-            show_send_order(plans)
-
-        elif action == send_label:
-            #
-            # Analyze again immediately before sending.
-            # The directory may have changed while the
-            # menu was open.
-            #
-            plans = analyze_files()
-
-            send_files(plans)
-
-        elif action == "Write versions to files":
-            write_versions_to_files()
-
-        elif action == "View config":
-            view_config()
-
-        elif action == "Help":
-            show_help()
-
-        elif action == "Exit":
-            break
+    if session_logged:
+        log.info("ODF Sender closed")
 
 
 if __name__ == "__main__":
