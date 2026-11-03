@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sys
@@ -6,11 +7,11 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from InquirerPy import inquirer
-from InquirerPy.base.control import Choice
 from InquirerPy.utils import get_style
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -18,6 +19,7 @@ from rich.table import Table
 
 console = Console()
 
+APP_VERSION = "1.2"
 TOKEN_HEADER = "x-ApiKey"
 APP_DIR = (
     Path(sys.executable).resolve().parent
@@ -27,6 +29,8 @@ APP_DIR = (
 CONFIG_FILE = APP_DIR / "config.json"
 VERSIONS_FILE = APP_DIR / "versions.json"
 HTTP_TIMEOUT_SECONDS = 30
+log = logging.getLogger("odfsender")
+AUTO_MODES = ("auto", "auto-as-is")
 CONFIG: dict[str, Any] = {}
 MENU_STYLE = get_style(
     {
@@ -37,6 +41,34 @@ MENU_STYLE = get_style(
         "pointer": "fg:#ffffff bg:#005fb8",
     }
 )
+
+
+def setup_logging() -> None:
+    """
+    Starts a new log file next to the app for this run, named
+    sender_yyyy-mm-dd_hh-MM-ss.log.
+    If the log cannot be opened, the sender keeps working without it.
+    """
+
+    log.setLevel(logging.INFO)
+
+    log_file = APP_DIR / (
+        "sender_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
+    )
+
+    try:
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+    except OSError as e:
+        console.print(
+            f"[yellow]Could not open {log_file.name}: {e}. "
+            "Continuing without a log file.[/yellow]"
+        )
+        return
+
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+    )
+    log.addHandler(handler)
 
 
 def pause_before_exit() -> None:
@@ -245,7 +277,7 @@ def load_config() -> bool:
         console.print()
         console.print()
         console.print(
-            '[green]Note: You can provide a specific version number such as 5, use "auto" to automatically increment the version before sending each XML, or null to send XML exactly as-is.[/green]'
+            '[green]Note: You can provide a specific version number such as 5, use "auto" to automatically increment the version before sending each XML (first send starts at 1), "auto-as-is" to do the same but start with the version inside the file, or null to send XML exactly as-is.[/green]'
         )
         console.print()
         console.print()
@@ -284,10 +316,12 @@ def load_config() -> bool:
         version = data["VERSION"]
         if not (
             version is None
-            or version == "auto"
+            or version in AUTO_MODES
             or (isinstance(version, int) and not isinstance(version, bool))
         ):
-            raise ValueError('VERSION must be null, an integer, or "auto".')
+            raise ValueError(
+                'VERSION must be null, an integer, "auto", or "auto-as-is".'
+            )
 
     except (OSError, json.JSONDecodeError, ValueError) as e:
         console.print(
@@ -321,7 +355,11 @@ def get_xml_files() -> list[Path]:
     )
 
 
-def analyze_files(first_send: str = "increment") -> list[FilePlan]:
+def is_auto() -> bool:
+    return CONFIG["VERSION"] in AUTO_MODES
+
+
+def analyze_files() -> list[FilePlan]:
     """
     Reads and validates all XML files beforehand.
 
@@ -330,11 +368,9 @@ def analyze_files(first_send: str = "increment") -> list[FilePlan]:
       - preview
       - send planning
 
-    first_send only matters in "auto" mode, for files that have no
-    remembered version yet:
-      - "increment": file version + 1
-      - "as-is":     file version unchanged
-      - "one":       start at 1
+    For files that have no remembered version yet:
+      - "auto":       start with 1
+      - "auto-as-is": start with the version inside the file
     """
 
     files = get_xml_files()
@@ -369,15 +405,13 @@ def analyze_files(first_send: str = "increment") -> list[FilePlan]:
             if CONFIG["VERSION"] is None:
                 version_to_send = None
 
-            elif CONFIG["VERSION"] == "auto":
+            elif is_auto():
                 if remembered_version is not None:
                     version_to_send = remembered_version + 1
-                elif first_send == "as-is":
+                elif CONFIG["VERSION"] == "auto-as-is":
                     version_to_send = current_version
-                elif first_send == "one":
-                    version_to_send = 1
                 else:
-                    version_to_send = current_version + 1
+                    version_to_send = 1
 
             else:
                 version_to_send = int(CONFIG["VERSION"])
@@ -420,7 +454,7 @@ def analyze_files(first_send: str = "increment") -> list[FilePlan]:
 # HTTP
 # ============================================================
 
-def send_xml(url: str, xml: bytes) -> None:
+def send_xml(url: str, xml: bytes) -> int:
     request = urllib.request.Request(
         url=url,
         data=xml,
@@ -441,6 +475,8 @@ def send_xml(url: str, xml: bytes) -> None:
                 raise RuntimeError(
                     f"HTTP {response.status}"
                 )
+
+            return response.status
 
     except urllib.error.HTTPError as e:
         raise RuntimeError(
@@ -508,10 +544,12 @@ def show_help() -> None:
         "are remembered."
     )
     console.print(
-        "         For files with no remembered version, you are asked when "
-        "sending: send as is (keep the version inside the file), "
-        "increment it, or start with 1. The send order shows the result "
-        "before you confirm."
+        "         Files with no remembered version start with 1 "
+        "(then 2, 3, ... on the next sends)."
+    )
+    console.print(
+        '  [bold]"auto-as-is"[/bold]  Same as "auto", but files with no '
+        "remembered version start with the version inside the file."
     )
     console.print(
         '  [bold]An integer[/bold]  Send every file with exactly that version '
@@ -613,59 +651,6 @@ def preview(plans: list[FilePlan]) -> None:
     console.print()
 
 
-def count_first_sends(plans: list[FilePlan]) -> int:
-    """Files that "auto" mode has no remembered version for."""
-
-    if CONFIG["VERSION"] != "auto":
-        return 0
-
-    return sum(
-        1
-        for plan in plans
-        if plan.error is None
-        and plan.remembered_version is None
-    )
-
-
-def ask_first_send(plans: list[FilePlan], current: str) -> str | None:
-    """
-    In "auto" mode, asks how files without a remembered version should
-    be numbered. Returns the choice, or None if the user cancels.
-    Nothing is asked when every file is already remembered.
-    """
-
-    first_sends = count_first_sends(plans)
-
-    if first_sends == 0:
-        return current
-
-    valid = sum(1 for plan in plans if plan.error is None)
-
-    return inquirer.select(
-        message=(
-            f"{first_sends} of {valid} file(s) have no remembered "
-            "version. How should they be numbered?"
-        ),
-        choices=[
-            Choice(
-                "as-is",
-                "Send as is (use the version inside the file, e.g. 3 -> 3)",
-            ),
-            Choice(
-                "increment",
-                "Increment and send (e.g. 3 -> 4)",
-            ),
-            Choice(
-                "one",
-                "Start with 1 (then 2, 3, ... on the next sends)",
-            ),
-            Choice(None, "Cancel"),
-        ],
-        default=current,
-        style=MENU_STYLE,
-    ).execute()
-
-
 def show_send_order(
     plans: list[FilePlan],
     read_only: bool = True,
@@ -721,10 +706,7 @@ def show_send_order(
                 f"{plan.current_version} -> {plan.version_to_send}"
             )
 
-        if (
-            CONFIG["VERSION"] == "auto"
-            and plan.remembered_version is None
-        ):
+        if is_auto() and plan.remembered_version is None:
             version += " (first send)"
 
         if (
@@ -815,6 +797,7 @@ def send_files(plans: list[FilePlan]) -> None:
     ).execute()
 
     if not confirmed:
+        log.info("Send cancelled by user (%d file(s) ready)", len(valid_plans))
         return
 
     versions = (
@@ -822,6 +805,23 @@ def send_files(plans: list[FilePlan]) -> None:
         if CONFIG["VERSION"] is not None
         else {}
     )
+
+    log.info(
+        "Send started: %d file(s) to %d endpoint(s), VERSION=%r",
+        len(valid_plans),
+        len(CONFIG["URLS"]),
+        CONFIG["VERSION"],
+    )
+
+    for url in CONFIG["URLS"]:
+        log.info("Endpoint: %s", url)
+
+    for plan in plans:
+        if plan.error is not None:
+            log.warning("Skipped %s: %s", plan.file.name, plan.error)
+
+    fully_sent = 0
+    failed = 0
 
     console.print()
 
@@ -840,6 +840,12 @@ def send_files(plans: list[FilePlan]) -> None:
                     "  Version: unchanged"
                 )
 
+                log.info(
+                    "%s: sending unchanged (version %s)",
+                    plan.file.name,
+                    plan.current_version,
+                )
+
             else:
                 xml_to_send = set_xml_version(
                     original_xml,
@@ -848,6 +854,14 @@ def send_files(plans: list[FilePlan]) -> None:
 
                 console.print(
                     f"  Version: {plan.version_to_send}"
+                )
+
+                log.info(
+                    "%s: sending version %s (file has %s, remembered %s)",
+                    plan.file.name,
+                    plan.version_to_send,
+                    plan.current_version,
+                    plan.remembered_version,
                 )
 
             all_succeeded = True
@@ -867,13 +881,20 @@ def send_files(plans: list[FilePlan]) -> None:
                             total=None,
                         )
 
-                        send_xml(
+                        status = send_xml(
                             url,
                             xml_to_send,
                         )
 
                     console.print(
                         f"  [green]✓[/green] {url}"
+                    )
+
+                    log.info(
+                        "%s: OK %s -> HTTP %s",
+                        plan.file.name,
+                        url,
+                        status,
                     )
 
                 except Exception as e:
@@ -886,6 +907,18 @@ def send_files(plans: list[FilePlan]) -> None:
                     console.print(
                         f"    [red]{e}[/red]"
                     )
+
+                    log.error(
+                        "%s: FAILED %s -> %s",
+                        plan.file.name,
+                        url,
+                        e,
+                    )
+
+            if all_succeeded:
+                fully_sent += 1
+            else:
+                failed += 1
 
             if (
                 all_succeeded
@@ -902,12 +935,35 @@ def send_files(plans: list[FilePlan]) -> None:
                     f"{plan.version_to_send}[/dim]"
                 )
 
+                log.info(
+                    "%s: remembered version %s",
+                    plan.file.name,
+                    plan.version_to_send,
+                )
+
+            elif not all_succeeded:
+                log.warning(
+                    "%s: not remembered (not every endpoint accepted it)",
+                    plan.file.name,
+                )
+
         except Exception as e:
+            failed += 1
+
             console.print(
                 f"  [red]ERROR: {e}[/red]"
             )
 
+            log.exception("%s: ERROR %s", plan.file.name, e)
+
         console.print()
+
+    log.info(
+        "Send finished: %d of %d file(s) fully sent, %d failed",
+        fully_sent,
+        len(valid_plans),
+        failed,
+    )
 
 
 # ============================================================
@@ -1051,12 +1107,13 @@ def main() -> None:
         pause_before_exit()
         return
 
-    #
-    # How "auto" numbers files that have no remembered version yet.
-    # Asked again on every send while such files exist; the last
-    # answer is the default and is what Preview/Show send order use.
-    #
-    first_send = "increment"
+    setup_logging()
+
+    log.info(
+        "ODF Sender v%s started (VERSION=%r)",
+        APP_VERSION,
+        CONFIG["VERSION"],
+    )
 
     while True:
         #
@@ -1065,7 +1122,7 @@ def main() -> None:
         # This means "Send 56 files" reflects what's actually
         # present and valid right now.
         #
-        plans = analyze_files(first_send)
+        plans = analyze_files()
 
         sendable_count = sum(
             1
@@ -1079,7 +1136,7 @@ def main() -> None:
 
         if CONFIG["VERSION"] is None:
             send_label += " without changing versions"
-        elif CONFIG["VERSION"] == "auto":
+        elif is_auto():
             send_label += " and increment the version"
         else:
             send_label += f" with Version {CONFIG['VERSION']}"
@@ -1094,7 +1151,7 @@ def main() -> None:
             )
 
         action = inquirer.select(
-            message="ODF Sender",
+            message=f"ODF Sender v{APP_VERSION}",
             choices=[
                 preview_label,
                 "Show send order",
@@ -1120,16 +1177,7 @@ def main() -> None:
             # The directory may have changed while the
             # menu was open.
             #
-            plans = analyze_files(first_send)
-
-            choice = ask_first_send(plans, first_send)
-
-            if choice is None:
-                continue
-
-            if choice != first_send:
-                first_send = choice
-                plans = analyze_files(first_send)
+            plans = analyze_files()
 
             send_files(plans)
 
